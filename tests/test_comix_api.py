@@ -265,7 +265,7 @@ class ComixChapterTests(unittest.TestCase):
             timeout=0.1,
         ))
 
-    def test_cookie_save_is_atomic_and_uses_canonical_path(self):
+    def test_cookie_save_is_atomic_and_uses_user_owned_path(self):
         class CookieJar:
             async def save(self, path, pattern=".*"):
                 Path(path).write_bytes(b"cookies")
@@ -280,6 +280,16 @@ class ComixChapterTests(unittest.TestCase):
 
             self.assertEqual(target.read_bytes(), b"cookies")
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_cookie_candidates_keep_source_tree_as_legacy_fallback(self):
+        self.assertNotEqual(
+            comix_module._CANONICAL_COOKIE_FILE,
+            comix_module._LEGACY_COOKIE_FILE,
+        )
+        self.assertEqual(
+            comix_module._cookie_file_candidates()[0],
+            comix_module._CANONICAL_COOKIE_FILE,
+        )
 
     def test_normalizes_manga_summary_shape(self):
         summary = ComixAPI._normalize_manga_summary({

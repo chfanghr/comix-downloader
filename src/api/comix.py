@@ -14,6 +14,7 @@ from typing import Optional
 from ..utils.retry import retry_with_backoff
 from ..utils.logger import get_logger
 from ..utils.hash import generate_comix_hash
+from ..utils.config import default_config_path
 from ..utils.nodriver_browser import start_browser
 from ..utils.nodriver_compat import load_cdp_page
 from ..utils.comix_session import publish_comix_credentials
@@ -23,7 +24,8 @@ logger = get_logger(__name__)
 # Global lock to synchronize browser creation and cookie loading/saving across threads
 _browser_lock = threading.Lock()
 
-_CANONICAL_COOKIE_FILE = Path(__file__).resolve().parents[2] / "cf_cookies.dat"
+_CANONICAL_COOKIE_FILE = default_config_path().parent / "cf_cookies.dat"
+_LEGACY_COOKIE_FILE = Path(__file__).resolve().parents[2] / "cf_cookies.dat"
 _CLOUDFLARE_TIMEOUT_SECONDS = 60.0
 _CLOUDFLARE_POLL_SECONDS = 0.25
 _CLOUDFLARE_TITLE = "just a moment..."
@@ -44,13 +46,13 @@ class ComixPageUnavailableError(RuntimeError):
 def _cookie_file_candidates() -> list[Path]:
     """Return canonical and legacy cookie locations without duplicating paths."""
     candidates = [_CANONICAL_COOKIE_FILE]
-    legacy = Path.cwd() / "cf_cookies.dat"
-    try:
-        same_file = legacy.resolve() == _CANONICAL_COOKIE_FILE.resolve()
-    except OSError:
-        same_file = legacy == _CANONICAL_COOKIE_FILE
-    if not same_file:
-        candidates.append(legacy)
+    for legacy in (_LEGACY_COOKIE_FILE, Path.cwd() / "cf_cookies.dat"):
+        try:
+            same_file = any(legacy.resolve() == path.resolve() for path in candidates)
+        except OSError:
+            same_file = legacy in candidates
+        if not same_file:
+            candidates.append(legacy)
     return candidates
 
 
