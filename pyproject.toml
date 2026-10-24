@@ -1,0 +1,23 @@
+[project]
+name = "comix-downloader"
+version = "0.1.0"
+description = "A manga downloader for comix.to with GUI and CLI interfaces"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "nodriver==0.50.3",
+  "pillow",
+  "reportlab",
+  "requests",
+  "rich",
+  "typer[all]",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
