@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import json
 import random
-import shutil
 import ssl
 import threading
 import time
@@ -100,6 +99,14 @@ class _ChapterProgress:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return {}
 
+    def is_complete(self) -> bool:
+        try:
+            metadata = json.loads(self.manifest.read_text(encoding="utf-8"))
+            entry = metadata.get(self.comic_id, metadata)
+            return isinstance(entry, dict) and entry.get("version") == 1 and bool(entry.get("complete"))
+        except (OSError, TypeError, json.JSONDecodeError):
+            return False
+
     def save(self, index: int, data: bytes) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         page_path = self.directory / f"{index:05d}.bin"
@@ -118,6 +125,7 @@ class _ChapterProgress:
                 self.comic_id: {
                     "version": 1,
                     "total": self.total,
+                    "complete": False,
                     "completed": completed,
                 }
             }),
@@ -125,8 +133,19 @@ class _ChapterProgress:
         )
         temporary_manifest.replace(self.manifest)
 
-    def clear(self) -> None:
-        shutil.rmtree(self.directory, ignore_errors=True)
+    def mark_complete(self) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        metadata = {}
+        try:
+            metadata = json.loads(self.manifest.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError):
+            pass
+        entry = metadata.get(self.comic_id, {})
+        entry.update({"version": 1, "total": self.total, "complete": True})
+        metadata[self.comic_id] = entry
+        temporary_manifest = self.manifest.with_suffix(".tmp")
+        temporary_manifest.write_text(json.dumps(metadata), encoding="utf-8")
+        temporary_manifest.replace(self.manifest)
 
 
 class ImageDownloadPool:
@@ -408,6 +427,20 @@ class ChapterDownloader:
         manga_folder = self.manga.get_safe_title()
         chapter_folder = chapter.get_safe_folder_name()
         base_path = Path(self.config.download_path) / manga_folder
+        comic_id = str(self.manga.hash_id or self.manga.manga_id or "unknown")
+        progress_store = _ChapterProgress(
+            base_path / ".comix-progress" / f"{chapter.chapter_id}-{chapter_folder}",
+            0,
+            comic_id,
+        )
+
+        artifact = (
+            base_path / chapter_folder
+            if self.config.output_format == OutputFormat.IMAGES
+            else base_path / f"{chapter_folder}.{self.config.output_format.value}"
+        )
+        if progress_store.is_complete() and artifact.exists():
+            return True, f"Already downloaded {chapter.get_display_name()}"
         
         try:
             if is_cancelled():
@@ -457,11 +490,7 @@ class ChapterDownloader:
                     f"({len(image_urls)}/{expected_pages} pages ready)"
                 )
 
-            progress_store = _ChapterProgress(
-                base_path / ".comix-progress" / f"{chapter.chapter_id}-{chapter_folder}",
-                len(image_urls),
-                str(self.manga.hash_id or self.manga.manga_id or "unknown"),
-            )
+            progress_store.total = len(image_urls)
             cached_images = progress_store.load()
             pending_urls = {
                 index: url
@@ -622,7 +651,7 @@ class ChapterDownloader:
                     cbz_path = base_path / f"{chapter_folder}.cbz"
                     create_cbz_from_bytes(image_data, cbz_path, self.manga, chapter)
 
-            progress_store.clear()
+            progress_store.mark_complete()
             
             if progress and task_id:
                 progress.update(task_id, completed=len(image_urls))

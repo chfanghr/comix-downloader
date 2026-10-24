@@ -90,6 +90,7 @@ The manifest is `progress.json` and is keyed by the comic ID:
   "1nkd": {
     "version": 1,
     "total": 44,
+    "complete": true,
     "completed": [1, 2, 3]
   }
 }
@@ -97,7 +98,8 @@ The manifest is `progress.json` and is keyed by the comic ID:
 
 Cached page bytes are stored beside the manifest as zero-padded `.bin` files.
 Interrupted runs validate and reuse completed pages, downloading only missing
-pages. Progress state is removed after successful chapter completion.
+pages. Completed manifests remain so already-downloaded chapters can be
+skipped on later runs; new remote chapters are still downloaded normally.
 
 ## Verification
 
