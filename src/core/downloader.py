@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import json
 import random
+import shutil
 import ssl
 import threading
 import time
@@ -146,6 +147,9 @@ class _ChapterProgress:
         temporary_manifest = self.manifest.with_suffix(".tmp")
         temporary_manifest.write_text(json.dumps(metadata), encoding="utf-8")
         temporary_manifest.replace(self.manifest)
+
+    def reset(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 class ImageDownloadPool:
@@ -433,6 +437,9 @@ class ChapterDownloader:
             0,
             comic_id,
         )
+
+        if self.config.ignore_progress:
+            progress_store.reset()
 
         artifact = (
             base_path / chapter_folder

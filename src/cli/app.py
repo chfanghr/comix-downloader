@@ -167,7 +167,12 @@ def download(
     chapters: str = typer.Option(None, "--chapters", "-c", help="Chapter selection (e.g., '1-10', 'all')"),
     format: str = typer.Option(None, "--format", "-f", help="Output format: images, pdf, cbz"),
     output: str = typer.Option(None, "--output", "-o", help="Output directory"),
-    headless: bool = typer.Option(None, "--headless/--no-headless", help="Run browser in headless mode")
+    headless: bool = typer.Option(None, "--headless/--no-headless", help="Run browser in headless mode"),
+    ignore_progress: bool = typer.Option(
+        False,
+        "--ignore-progress",
+        help="Ignore and reset saved chapter download progress",
+    ),
 ):
     """Download manga directly from command line."""
     if url:
@@ -183,6 +188,7 @@ def download(
             output_format=OutputFormat(format) if format else config.output_format,
             download_path=output if output else config.download_path,
             headless=headless if headless is not None else config.headless,
+            ignore_progress=ignore_progress,
         )
         setup_logging(enable=config.enable_logs)
         

@@ -26,3 +26,6 @@ class ChapterProgressTests(unittest.TestCase):
 
             (progress.directory / "00002.bin").write_bytes(b"not an image")
             self.assertEqual(progress.load(), {1: data})
+
+            progress.reset()
+            self.assertFalse(progress.directory.exists())
