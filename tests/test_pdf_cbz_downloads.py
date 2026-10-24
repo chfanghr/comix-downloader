@@ -292,7 +292,7 @@ class CliConfigTests(unittest.TestCase):
 
             persisted = ConfigManager("config.json").get_download_config()
             self.assertEqual(persisted.output_format, OutputFormat.IMAGES)
-            self.assertEqual(persisted.download_path, "downloads")
+            self.assertEqual(persisted.download_path, ".")
             self.assertTrue(persisted.headless)
 
 

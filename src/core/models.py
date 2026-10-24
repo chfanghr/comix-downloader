@@ -122,7 +122,7 @@ class DownloadConfig:
     enable_logs: bool = False
     max_chapter_workers: int = 3
     max_image_workers: int = 5
-    download_path: str = "downloads"
+    download_path: str = "."
     retry_count: int = 3
     retry_delay: float = 2.0
     headless: bool = True

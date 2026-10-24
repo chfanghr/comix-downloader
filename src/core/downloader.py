@@ -5,7 +5,9 @@ Main downloader with threading support for concurrent downloads.
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+import json
 import random
+import shutil
 import ssl
 import threading
 import time
@@ -63,6 +65,68 @@ class ImageFailure:
     attempts: int
     message: str
     host: str = ""
+
+
+class _ChapterProgress:
+    """Persist successfully downloaded pages so interrupted chapters resume."""
+
+    def __init__(self, directory: Path, total: int, comic_id: str):
+        self.directory = directory
+        self.manifest = directory / "progress.json"
+        self.total = total
+        self.comic_id = comic_id
+
+    def load(self) -> dict[int, bytes]:
+        try:
+            metadata = json.loads(self.manifest.read_text(encoding="utf-8"))
+            entry = metadata.get(self.comic_id, metadata)
+            if not isinstance(entry, dict):
+                return {}
+            if entry.get("version") != 1 or entry.get("total") != self.total:
+                return {}
+            completed: dict[int, bytes] = {}
+            for raw_index in entry.get("completed", []):
+                index = int(raw_index)
+                if not 0 < index <= self.total:
+                    continue
+                path = self.directory / f"{index:05d}.bin"
+                try:
+                    data = path.read_bytes()
+                    validate_image_bytes(data)
+                except (OSError, ValueError):
+                    continue
+                completed[index] = data
+            return completed
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+
+    def save(self, index: int, data: bytes) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        page_path = self.directory / f"{index:05d}.bin"
+        temporary_page = page_path.with_suffix(".tmp")
+        temporary_page.write_bytes(data)
+        temporary_page.replace(page_path)
+
+        completed = sorted(
+            int(path.stem)
+            for path in self.directory.glob("*.bin")
+            if path.stem.isdigit()
+        )
+        temporary_manifest = self.manifest.with_suffix(".tmp")
+        temporary_manifest.write_text(
+            json.dumps({
+                self.comic_id: {
+                    "version": 1,
+                    "total": self.total,
+                    "completed": completed,
+                }
+            }),
+            encoding="utf-8",
+        )
+        temporary_manifest.replace(self.manifest)
+
+    def clear(self) -> None:
+        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 class ImageDownloadPool:
@@ -201,6 +265,7 @@ class ImageDownloader:
         self,
         indexed_urls: dict[int, str],
         on_progress: Optional[Callable[[int, int], None]] = None,
+        on_image: Optional[Callable[[int, bytes], None]] = None,
     ) -> ImageDownloadReport:
         own_pool = self.pool is None
         pool = self.pool or ImageDownloadPool(self.config.max_image_workers)
@@ -220,6 +285,8 @@ class ImageDownloader:
                 try:
                     result_index, data, error = future.result()
                     if data is not None:
+                        if on_image:
+                            on_image(result_index, data)
                         results.append((result_index, data))
                     else:
                         failed.append((result_index, error or "Download failed"))
@@ -263,7 +330,8 @@ class ImageDownloader:
         image_urls: list[str],
         progress: Optional[Progress] = None,
         task_id: Optional[TaskID] = None,
-        on_progress: Optional[Callable[[int, int], None]] = None
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        on_image: Optional[Callable[[int, bytes], None]] = None,
     ) -> ImageDownloadReport:
         """
         Download all images concurrently.
@@ -281,6 +349,7 @@ class ImageDownloader:
         report = self._download_indexed(
             {index: url for index, url in enumerate(image_urls, 1)},
             callback,
+            on_image,
         )
         if report.failed:
             logger.warning("%s images failed to download", len(report.failed))
@@ -290,9 +359,10 @@ class ImageDownloader:
         self,
         indexed_urls: dict[int, str],
         on_progress: Optional[Callable[[int, int], None]] = None,
+        on_image: Optional[Callable[[int, bytes], None]] = None,
     ) -> ImageDownloadReport:
         """Retry a selected set of page indexes without redownloading others."""
-        return self._download_indexed(indexed_urls, on_progress)
+        return self._download_indexed(indexed_urls, on_progress, on_image)
 
     def download_all_images(
         self,
@@ -386,7 +456,19 @@ class ChapterDownloader:
                     f"Incomplete image extraction for {chapter.get_display_name()} "
                     f"({len(image_urls)}/{expected_pages} pages ready)"
                 )
-            
+
+            progress_store = _ChapterProgress(
+                base_path / ".comix-progress" / f"{chapter.chapter_id}-{chapter_folder}",
+                len(image_urls),
+                str(self.manga.hash_id or self.manga.manga_id or "unknown"),
+            )
+            cached_images = progress_store.load()
+            pending_urls = {
+                index: url
+                for index, url in enumerate(image_urls, 1)
+                if index not in cached_images
+            }
+
             # Create task for image downloads
             task_id = None
             if progress:
@@ -394,10 +476,38 @@ class ChapterDownloader:
                     f"[cyan]  └─ {chapter.get_display_name()}",
                     total=len(image_urls)
                 )
-            
-            # Download all images
-            download_report = self.image_downloader.download_all_images_report(
-                image_urls, progress, task_id, on_progress=on_image_progress
+                if cached_images:
+                    progress.update(task_id, completed=len(cached_images))
+
+            def save_progress(index: int, data: bytes) -> None:
+                try:
+                    progress_store.save(index, data)
+                except OSError as exc:
+                    logger.warning("Failed saving progress for page %s: %s", index, exc)
+
+            def report_progress(current: int, total: int) -> None:
+                if progress and task_id:
+                    progress.advance(task_id)
+                if on_image_progress:
+                    on_image_progress(current, total)
+
+            # Download only pages not already present in the progress cache.
+            if pending_urls:
+                download_report = self.image_downloader.download_indexed_images(
+                    pending_urls,
+                    on_progress=report_progress,
+                    on_image=save_progress,
+                )
+            else:
+                download_report = ImageDownloadReport([], [], 0)
+
+            existing_by_index = dict(cached_images)
+            existing_by_index.update(dict(download_report.images))
+            download_report = ImageDownloadReport(
+                images=sorted(existing_by_index.items()),
+                failed=download_report.failed,
+                total=len(image_urls),
+                failure_details=download_report.failure_details,
             )
 
             # Signed CDN URLs can expire between reader extraction and the
@@ -442,7 +552,10 @@ class ChapterDownloader:
                             "Retrying %s failed pages with refreshed chapter sources",
                             len(replacements),
                         )
-                        recovered = self.image_downloader.download_indexed_images(replacements)
+                        recovered = self.image_downloader.download_indexed_images(
+                            replacements,
+                            on_image=save_progress,
+                        )
                         recovered_by_index = dict(recovered.images)
                         existing_by_index = dict(download_report.images)
                         existing_by_index.update(recovered_by_index)
@@ -508,6 +621,8 @@ class ChapterDownloader:
                     from ..formats.cbz import create_cbz_from_bytes
                     cbz_path = base_path / f"{chapter_folder}.cbz"
                     create_cbz_from_bytes(image_data, cbz_path, self.manga, chapter)
+
+            progress_store.clear()
             
             if progress and task_id:
                 progress.update(task_id, completed=len(image_urls))
