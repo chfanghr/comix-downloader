@@ -25,7 +25,6 @@ logger = get_logger(__name__)
 _browser_lock = threading.Lock()
 
 _CANONICAL_COOKIE_FILE = default_config_path().parent / "cf_cookies.dat"
-_LEGACY_COOKIE_FILE = Path(__file__).resolve().parents[2] / "cf_cookies.dat"
 _CLOUDFLARE_TIMEOUT_SECONDS = 60.0
 _CLOUDFLARE_POLL_SECONDS = 0.25
 _CLOUDFLARE_TITLE = "just a moment..."
@@ -44,15 +43,20 @@ class ComixPageUnavailableError(RuntimeError):
 
 
 def _cookie_file_candidates() -> list[Path]:
-    """Return canonical and legacy cookie locations without duplicating paths."""
+    """Return writable and working-directory cookie locations.
+
+    The source tree is immutable when running from a Nix store path, so bundled
+    files must never be treated as a cookie database.  A cookie file in the
+    current directory remains supported for migration from older installations.
+    """
     candidates = [_CANONICAL_COOKIE_FILE]
-    for legacy in (_LEGACY_COOKIE_FILE, Path.cwd() / "cf_cookies.dat"):
-        try:
-            same_file = any(legacy.resolve() == path.resolve() for path in candidates)
-        except OSError:
-            same_file = legacy in candidates
-        if not same_file:
-            candidates.append(legacy)
+    legacy = Path.cwd() / "cf_cookies.dat"
+    try:
+        same_file = any(legacy.resolve() == path.resolve() for path in candidates)
+    except OSError:
+        same_file = legacy in candidates
+    if not same_file:
+        candidates.append(legacy)
     return candidates
 
 
@@ -443,7 +447,14 @@ class ComixAPI:
             const ratings = {json.dumps(list(cls.DISCOVERY_CONTENT_RATINGS))};
             const highlights = {str(bool(highlights)).lower()};
 
-            async function resolveEnvModule() {{
+            async function resolveApiModule() {{
+                const loadedModules = performance.getEntriesByType('resource')
+                    .map((entry) => entry.name)
+                    .filter((url) => /\\/(?:env|apicore)-[^/]+\\.js(?:$|\\?)/.test(url));
+                for (const moduleUrl of loadedModules) {{
+                    try {{ return await import(moduleUrl); }} catch (e) {{}}
+                }}
+
                 const moduleScripts = Array.from(document.querySelectorAll('script[type="module"][src]'))
                     .map((script) => script.src);
 
@@ -452,7 +463,7 @@ class ComixAPI:
                         const response = await fetch(scriptUrl, {{ credentials: 'same-origin' }});
                         if (!response.ok) continue;
                         const source = await response.text();
-                        const matches = Array.from(source.matchAll(/from\\s*["']\\.\\/(env-[^"']+\\.js)["']/g));
+                        const matches = Array.from(source.matchAll(/from\\s*["']\\.\\/((?:env|apicore)-[^"']+\\.js)["']/g));
                         for (const match of matches) {{
                             const moduleUrl = new URL(match[1], scriptUrl).href;
                             try {{ return await import(moduleUrl); }} catch (e) {{}}
@@ -465,29 +476,32 @@ class ComixAPI:
             function findMangaApi(module) {{
                 for (const value of Object.values(module)) {{
                     if (value && typeof value === 'object' &&
-                        typeof value.list === 'function' && typeof value.top === 'function') {{
+                        ((typeof value.list === 'function' && typeof value.top === 'function') ||
+                         (typeof value.ks === 'function' && typeof value.XU === 'function'))) {{
                         return value;
                     }}
                 }}
                 return null;
             }}
 
-            const module = await resolveEnvModule();
+            const module = await resolveApiModule();
             const api = findMangaApi(module);
             if (!api) throw new Error('Comix manga API export not found');
+            const list = api.list || api.ks;
+            const top = api.top || api.XU;
 
             if (highlights) {{
-                const trending = await api.top({{
+                const trending = await top({{
                     type: 'trending', days: 7, limit, content_rating: ratings,
                 }});
-                const latest = await api.list({{
+                const latest = await list({{
                     order: {{ chapter_updated_at: 'desc' }},
                     page: 1, limit, content_rating: ratings,
                 }});
                 return JSON.stringify({{ ok: true, trending, latest }});
             }}
 
-            const data = await api.list({{
+            const data = await list({{
                 keyword: keyword,
                 order: {{ relevance: 'desc' }},
                 page: pageNumber,
@@ -826,7 +840,14 @@ class ComixAPI:
             const limit = {cls.CHAPTERS_PAGE_LIMIT};
             const maxPages = {cls.MAX_CHAPTER_PAGES};
 
-            async function resolveEnvModule() {{
+            async function resolveApiModule() {{
+                const loadedModules = performance.getEntriesByType('resource')
+                    .map((entry) => entry.name)
+                    .filter((url) => /\\/(?:env|apicore)-[^/]+\\.js(?:$|\\?)/.test(url));
+                for (const moduleUrl of loadedModules) {{
+                    try {{ return await import(moduleUrl); }} catch (e) {{}}
+                }}
+
                 const moduleScripts = Array.from(document.querySelectorAll('script[type="module"][src]'))
                     .map((script) => script.src);
 
@@ -835,7 +856,7 @@ class ComixAPI:
                         const response = await fetch(scriptUrl, {{ credentials: 'same-origin' }});
                         if (!response.ok) continue;
                         const source = await response.text();
-                        const matches = Array.from(source.matchAll(/from\\s*["']\\.\\/(env-[^"']+\\.js)["']/g));
+                        const matches = Array.from(source.matchAll(/from\\s*["']\\.\\/((?:env|apicore)-[^"']+\\.js)["']/g));
                         for (const match of matches) {{
                             const moduleUrl = new URL(match[1], scriptUrl).href;
                             try {{
@@ -850,22 +871,24 @@ class ComixAPI:
 
             function findMangaApi(module) {{
                 for (const value of Object.values(module)) {{
-                    if (value && typeof value === 'object' && typeof value.chapters === 'function') {{
+                    if (value && typeof value === 'object' &&
+                        (typeof value.chapters === 'function' || typeof value.uw === 'function')) {{
                         return value;
                     }}
                 }}
                 return null;
             }}
 
-            const module = await resolveEnvModule();
+            const module = await resolveApiModule();
             const api = findMangaApi(module);
             if (!api) throw new Error('Comix manga API export not found');
+            const chapters = api.chapters || api.uw;
 
             const items = [];
             const seenIds = new Set();
 
             for (let page = 1; page <= maxPages; page += 1) {{
-                const data = await api.chapters(mangaCode, {{
+                const data = await chapters(mangaCode, {{
                     page,
                     limit,
                     order: {{ number: 'desc' }},
@@ -1228,7 +1251,7 @@ class ComixAPI:
                                 }}
                                 
                                 const i = el.querySelector('img');
-                                if (i && i.src) {{
+                                 if (i && i.src) {{
                                     if (i.src.startsWith('blob:')) {{
                                         try {{
                                             const canvas = document.createElement('canvas');

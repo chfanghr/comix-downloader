@@ -31,7 +31,6 @@ class SessionManager:
     def _headers() -> dict[str, str]:
         credentials = get_comix_credentials()
         return {
-            "Referer": "https://comix.to/",
             "User-Agent": credentials.user_agent or (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -87,9 +86,12 @@ class SessionManager:
         # not leak them to the independent image CDN hosts.
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-        if credentials.cookie_header and (host == "comix.to" or host.endswith(".comix.to")):
+        is_comix_host = host == "comix.to" or host.endswith(".comix.to")
+        if is_comix_host:
             headers = dict(kwargs.get("headers") or {})
-            headers.setdefault("Cookie", credentials.cookie_header)
+            headers.setdefault("Referer", "https://comix.to/")
+            if credentials.cookie_header:
+                headers.setdefault("Cookie", credentials.cookie_header)
             kwargs["headers"] = headers
 
         return session.get(url, **kwargs)

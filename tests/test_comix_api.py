@@ -281,15 +281,17 @@ class ComixChapterTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"cookies")
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
-    def test_cookie_candidates_keep_source_tree_as_legacy_fallback(self):
-        self.assertNotEqual(
-            comix_module._CANONICAL_COOKIE_FILE,
-            comix_module._LEGACY_COOKIE_FILE,
-        )
-        self.assertEqual(
-            comix_module._cookie_file_candidates()[0],
-            comix_module._CANONICAL_COOKIE_FILE,
-        )
+    def test_cookie_candidates_do_not_use_source_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(comix_module.Path, "cwd", return_value=Path(directory)):
+                candidates = comix_module._cookie_file_candidates()
+
+            self.assertEqual(candidates[0], comix_module._CANONICAL_COOKIE_FILE)
+            self.assertIn(Path(directory) / "cf_cookies.dat", candidates)
+            self.assertNotIn(
+                Path(__file__).resolve().parents[1] / "cf_cookies.dat",
+                candidates,
+            )
 
     def test_normalizes_manga_summary_shape(self):
         summary = ComixAPI._normalize_manga_summary({
@@ -359,6 +361,10 @@ class ComixChapterTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn("api.list", page.script)
+        self.assertIn("api.ks", page.script)
+        self.assertIn("api.XU", page.script)
+        self.assertIn("apicore", page.script)
+        self.assertIn("env", page.script)
         self.assertIn("relevance: 'desc'", page.script)
         self.assertIn("safe", page.script)
         self.assertIn("pornographic", page.script)
@@ -477,6 +483,9 @@ class ComixChapterTests(unittest.TestCase):
         self.assertEqual(rows[1]["chapter_id"], 1)
         self.assertEqual(rows[1]["group_name"], "Official")
         self.assertIn("api.chapters", page.script)
+        self.assertIn("api.uw", page.script)
+        self.assertIn("apicore", page.script)
+        self.assertIn("env", page.script)
         self.assertIn("order: { number: 'desc' }", page.script)
         self.assertEqual(
             page.evaluate_kwargs,
