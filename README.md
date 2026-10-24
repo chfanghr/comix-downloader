@@ -95,7 +95,7 @@ The legacy root and `gui/config.json` files are imported once and left intact.
 | Output Format | images / pdf / cbz | `images` |
 | Keep Images | Retain images after PDF/CBZ conversion | `No` |
 | Enable Logs | Show debug logging | `No` |
-| Download Path | Where to save downloads | `downloads` |
+| Download Path | Where to save downloads | `.` |
 | Max Chapter Workers | Concurrent chapter downloads | `3` |
 | Max Image Workers | Application-wide concurrent image downloads | `5` |
 | Run Browser Headless | Hide the automation browser window | `Yes` |

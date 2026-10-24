@@ -44,7 +44,7 @@ class ConfigManager:
         "enable_logs": False,
         "max_chapter_workers": 3,
         "max_image_workers": 5,
-        "download_path": "downloads",
+        "download_path": ".",
         "retry_count": 3,
         "retry_delay": 2.0,
         "chapters_display_limit": 20,  # 0 = show all
@@ -89,6 +89,8 @@ class ConfigManager:
         existing: list[tuple[Path, dict[str, Any]]] = []
         for path in candidates:
             if path == self.config_path or not path.exists():
+                continue
+            if path.resolve().as_posix().startswith("/nix/store/"):
                 continue
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
@@ -145,11 +147,11 @@ class ConfigManager:
             logger.warning(f"Invalid output_format {bad_format!r}; using images")
             output_format = OutputFormat.IMAGES
 
-        download_path = self.get("download_path", "downloads")
+        download_path = self.get("download_path", ".")
         if self.config_path == default_config_path():
             path = Path(str(download_path)).expanduser()
             if not path.is_absolute():
-                download_path = str((application_root() / path).resolve())
+                download_path = str((Path.cwd() / path).resolve())
 
         return DownloadConfig(
             output_format=output_format,
