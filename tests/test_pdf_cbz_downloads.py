@@ -64,6 +64,18 @@ class FormatWriterTests(unittest.TestCase):
                 self.assertIsNone(cbz.testzip())
                 self.assertEqual(cbz.namelist(), ["001.png", "002.jpg"])
 
+    def test_cbz_converts_webp_pages_to_png(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "webp.cbz"
+            source = image_bytes((200, 20, 20), "WEBP")
+
+            create_cbz_from_bytes([(1, source)], output)
+
+            with zipfile.ZipFile(output) as cbz:
+                self.assertEqual(cbz.namelist(), ["001.png"])
+                with Image.open(BytesIO(cbz.read("001.png"))) as image:
+                    self.assertEqual(image.format, "PNG")
+
     def test_writers_reject_invalid_images_without_final_or_part_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

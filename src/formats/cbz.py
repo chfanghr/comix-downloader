@@ -4,9 +4,11 @@ CBZ (Comic Book ZIP) creation with ComicInfo.xml metadata.
 
 import zipfile
 from pathlib import Path
+from io import BytesIO
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 from typing import Optional
+from PIL import Image
 from ..core.models import MangaInfo, Chapter
 from .images import get_image_extension, validate_image_bytes
 from ..utils.logger import get_logger
@@ -35,10 +37,15 @@ def _write_cbz(
     try:
         with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as cbz:
             for filename, source in entries:
-                if isinstance(source, Path):
+                data = source.read_bytes() if isinstance(source, Path) else source
+                if get_image_extension(data) == ".webp":
+                    data = _convert_webp_to_png(data)
+                    filename = f"{Path(filename).stem}.png"
+                    cbz.writestr(filename, data)
+                elif isinstance(source, Path):
                     cbz.write(source, filename)
                 else:
-                    cbz.writestr(filename, source)
+                    cbz.writestr(filename, data)
                 logger.debug(f"Added to CBZ: {filename}")
 
             if manga and chapter:
@@ -205,3 +212,11 @@ def create_cbz_from_bytes(
 def _get_extension_from_bytes(data: bytes) -> str:
     """Determine image extension from file header."""
     return get_image_extension(data)
+
+
+def _convert_webp_to_png(data: bytes) -> bytes:
+    """Convert WebP pages to a broadly supported CBZ image format."""
+    with Image.open(BytesIO(data)) as image:
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return output.getvalue()
