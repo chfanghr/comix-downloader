@@ -11,11 +11,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from ..utils.retry import retry_with_backoff
+from urllib.parse import urlencode
 from ..utils.logger import get_logger
-from ..utils.hash import generate_comix_hash
 from ..utils.nodriver_browser import start_browser
-from ..utils.nodriver_compat import load_cdp_page
+from ..utils.nodriver_compat import load_cdp_network, load_cdp_page
 from ..utils.comix_session import publish_comix_credentials
 
 logger = get_logger(__name__)
@@ -31,6 +30,29 @@ _INITIAL_DATA_TIMEOUT_SECONDS = 15.0
 _INITIAL_DATA_POLL_SECONDS = 0.05
 _CHAPTER_EXTRACTION_MIN_SECONDS = 180.0
 _CHAPTER_EXTRACTION_MAX_SECONDS = 900.0
+_BROWSE_API_TIMEOUT_SECONDS = 30.0
+_CHAPTER_LIST_TIMEOUT_SECONDS = 15.0
+_CHAPTER_PAGE_TIMEOUT_SECONDS = 10.0
+_WAF_COOKIE_NAME = "waf_pass"
+_WAF_CHALLENGE_URL = "https://comix.to/@waf/challenge"
+_WAF_TIMEOUT_SECONDS = 60.0
+
+_CHAPTER_ROWS_JS = """(() => {
+    const rows = Array.from(document.querySelectorAll('.mchap-item')).map(li => {
+        const a = li.querySelector('.mchap-row__primary');
+        const ch = li.querySelector('.mchap-row__ch');
+        const ti = li.querySelector('.mchap-row__title');
+        const gp = li.querySelector('.mchap-row__group');
+        return {
+            href: a ? a.getAttribute('href') : null,
+            chap_label: ch ? ch.textContent.trim() : null,
+            title: ti ? ti.textContent.trim() : null,
+            group: gp ? (gp.querySelector('span') ? gp.querySelector('span').textContent.trim() : gp.textContent.trim()) : null,
+            group_official: gp ? gp.classList.contains('is-official') : false,
+        };
+    });
+    return JSON.stringify(rows);
+})()"""
 
 
 class MangaInfoFetchError(RuntimeError):
@@ -118,6 +140,79 @@ async def _save_comix_cookies(browser) -> None:
             temporary_file.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+async def _has_waf_pass(browser) -> bool:
+    """Return whether the browser already holds Comix's WAF pass cookie."""
+    try:
+        cookies = await browser.cookies.get_all()
+    except Exception:
+        return False
+    return any(getattr(cookie, "name", "") == _WAF_COOKIE_NAME for cookie in cookies)
+
+
+async def _solve_comix_waf_challenge(
+    browser,
+    page,
+    *,
+    headless: bool,
+    force: bool = False,
+) -> bool:
+    """Open Comix's Turnstile gate and wait for the resulting WAF cookie.
+
+    Comix serves the HTML pages normally but gates the chapter API behind a
+    Turnstile check.  The challenge auto-completes in a normal browser and sets
+    ``waf_pass``; persisting that cookie keeps later chapter fetches fast.
+    """
+    if not force and await _has_waf_pass(browser):
+        return False
+
+    logger.info("Solving Comix WAF challenge (headless=%s)...", headless)
+    await page.get(_WAF_CHALLENGE_URL)
+    deadline = time.monotonic() + _WAF_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if await _has_waf_pass(browser):
+            await _save_comix_cookies(browser)
+            logger.info("Comix WAF challenge passed")
+            return True
+        await page.sleep(0.5)
+
+    raise RuntimeError(
+        f"Comix WAF verification did not complete within {int(_WAF_TIMEOUT_SECONDS)} seconds"
+    )
+
+
+async def _disable_comix_browser_cache(page) -> None:
+    """Bypass stale cached 403s for Comix's tokenized API requests."""
+    try:
+        cdp_network = load_cdp_network()
+        await page.send(cdp_network.enable())
+        await page.send(cdp_network.set_cache_disabled(cache_disabled=True))
+    except Exception as exc:
+        logger.debug("Could not disable Comix browser cache: %s", exc)
+
+
+async def _wait_for_chapter_rows(
+    page,
+    *,
+    timeout: float = _CHAPTER_LIST_TIMEOUT_SECONDS,
+    previous_first_href: Optional[str] = None,
+) -> list[dict]:
+    """Wait until the rendered chapter list has rows (and a new first page)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            rows_str = await page.evaluate(_CHAPTER_ROWS_JS)
+            rows = json.loads(rows_str) if isinstance(rows_str, str) and rows_str else []
+        except Exception:
+            rows = []
+        if rows and (
+            previous_first_href is None
+            or rows[0].get("href") != previous_first_href
+        ):
+            return rows
+        await page.sleep(0.25)
+    return []
 
 
 async def _publish_comix_session(browser, page) -> None:
@@ -291,12 +386,9 @@ def run_async(coro):
 class ComixAPI:
     """API wrapper for comix.to"""
     
-    BASE_URL = "https://comix.to/api/v2"
-    CHAPTERS_PAGE_LIMIT = 100
     MAX_CHAPTER_PAGES = 200
     DISCOVERY_PAGE_LIMIT = 20
     DISCOVERY_HIGHLIGHT_LIMIT = 8
-    DISCOVERY_CONTENT_RATINGS = ("safe", "suggestive", "erotica", "pornographic")
     
     @staticmethod
     def extract_manga_code(url: str) -> str:
@@ -423,96 +515,119 @@ class ComixAPI:
 
         return MangaBrowsePage(items=items, page=page, last_page=last_page, total=total)
 
+    @staticmethod
+    def _extract_discovery_highlights(initial_data: dict, limit: int) -> dict:
+        """Pull the homepage's server-rendered trending and latest rails."""
+        queries = initial_data.get("queries") if isinstance(initial_data, dict) else None
+        if not isinstance(queries, dict):
+            raise RuntimeError("Comix homepage did not include catalog data")
+
+        def items_from(value):
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict) and isinstance(value.get("items"), list):
+                return value["items"]
+            return []
+
+        trending = []
+        latest = []
+        fallback_top = []
+        fallback_list = []
+        for key, value in queries.items():
+            try:
+                parts = json.loads(key) if isinstance(key, str) else None
+            except json.JSONDecodeError:
+                parts = None
+            if not isinstance(parts, list) or len(parts) < 3 or parts[0] != "manga":
+                continue
+            params = parts[2] if isinstance(parts[2], dict) else {}
+            items = items_from(value)
+            if parts[1] == "top":
+                if params.get("type") == "trending":
+                    trending = items
+                if not fallback_top:
+                    fallback_top = items
+            elif parts[1] == "list":
+                if params.get("scope") == "hot":
+                    latest = items
+                if not fallback_list:
+                    fallback_list = items
+
+        trending = trending or fallback_top
+        latest = latest or fallback_list
+        if not trending and not latest:
+            raise RuntimeError("Comix homepage did not include trending or latest manga")
+        return {
+            "trending": trending[:limit],
+            "latest": {"items": latest[:limit]},
+        }
+
     @classmethod
-    async def _fetch_discovery_via_page_api(
-        cls,
-        page,
-        *,
-        keyword: str = "",
-        page_number: int = 1,
-        limit: int = DISCOVERY_PAGE_LIMIT,
-        highlights: bool = False,
-    ) -> dict:
-        """Fetch catalog data through Comix's own in-page API client."""
-        script = f"""(async () => {{
-            const keyword = {json.dumps(keyword)};
-            const pageNumber = {int(page_number)};
-            const limit = {int(limit)};
-            const ratings = {json.dumps(list(cls.DISCOVERY_CONTENT_RATINGS))};
-            const highlights = {str(bool(highlights)).lower()};
+    async def _fetch_browse_api(cls, page, *, keyword: str, page_number: int) -> dict:
+        """Reuse the catalog request Comix's browse page made for itself."""
+        deadline = time.monotonic() + _BROWSE_API_TIMEOUT_SECONDS
+        api_url = ""
+        while time.monotonic() < deadline:
+            try:
+                api_url = await page.evaluate(
+                    f"""(() => {{
+                        const keyword = {json.dumps(keyword)};
+                        const pageNumber = {int(page_number)};
+                        const entries = performance.getEntriesByType('resource')
+                            .map((entry) => entry.name)
+                            .filter((name) => {{
+                                try {{
+                                    const url = new URL(name);
+                                    return url.pathname === '/api/v1/manga'
+                                        && url.searchParams.get('page') === String(pageNumber)
+                                        && (url.searchParams.get('keyword') || '') === keyword;
+                                }} catch (error) {{
+                                    return false;
+                                }}
+                            }});
+                        return entries.length ? entries[entries.length - 1] : '';
+                    }})()""",
+                    return_by_value=True,
+                )
+            except Exception:
+                api_url = ""
+            if isinstance(api_url, str) and api_url:
+                break
+            await page.sleep(0.25)
 
-            async function resolveEnvModule() {{
-                const moduleScripts = Array.from(document.querySelectorAll('script[type="module"][src]'))
-                    .map((script) => script.src);
+        if not api_url:
+            raise RuntimeError("Comix browse API request was not observed")
 
-                for (const scriptUrl of moduleScripts) {{
-                    try {{
-                        const response = await fetch(scriptUrl, {{ credentials: 'same-origin' }});
-                        if (!response.ok) continue;
-                        const source = await response.text();
-                        const matches = Array.from(source.matchAll(/from\\s*["']\\.\\/(env-[^"']+\\.js)["']/g));
-                        for (const match of matches) {{
-                            const moduleUrl = new URL(match[1], scriptUrl).href;
-                            try {{ return await import(moduleUrl); }} catch (e) {{}}
-                        }}
-                    }} catch (e) {{}}
-                }}
-                throw new Error('Comix API module not found');
-            }}
-
-            function findMangaApi(module) {{
-                for (const value of Object.values(module)) {{
-                    if (value && typeof value === 'object' &&
-                        typeof value.list === 'function' && typeof value.top === 'function') {{
-                        return value;
-                    }}
-                }}
-                return null;
-            }}
-
-            const module = await resolveEnvModule();
-            const api = findMangaApi(module);
-            if (!api) throw new Error('Comix manga API export not found');
-
-            if (highlights) {{
-                const trending = await api.top({{
-                    type: 'trending', days: 7, limit, content_rating: ratings,
-                }});
-                const latest = await api.list({{
-                    order: {{ chapter_updated_at: 'desc' }},
-                    page: 1, limit, content_rating: ratings,
-                }});
-                return JSON.stringify({{ ok: true, trending, latest }});
-            }}
-
-            const data = await api.list({{
-                keyword: keyword,
-                order: {{ relevance: 'desc' }},
-                page: pageNumber,
-                limit,
-                content_rating: ratings,
-            }});
-            return JSON.stringify({{ ok: true, data }});
-        }})().catch((error) => JSON.stringify({{
-            ok: false,
-            error: error && error.message ? error.message : String(error),
-        }}))"""
-
-        result_str = await page.evaluate(
-            script,
+        response_str = await page.evaluate(
+            f"""(async () => {{
+                const response = await fetch({json.dumps(api_url)}, {{ credentials: 'same-origin' }});
+                return JSON.stringify({{ status: response.status, body: await response.text() }});
+            }})()""",
             await_promise=True,
             return_by_value=True,
         )
-        if not isinstance(result_str, str) or not result_str:
-            raise RuntimeError("Comix discovery API returned no serialized result")
+        if not isinstance(response_str, str) or not response_str:
+            raise RuntimeError("Comix browse API returned no serialized result")
         try:
-            result = json.loads(result_str)
+            response = json.loads(response_str)
         except (TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("Comix discovery API returned invalid JSON") from exc
+            raise RuntimeError("Comix browse API returned invalid JSON") from exc
+        if not isinstance(response, dict):
+            raise RuntimeError("Comix browse API returned an invalid response object")
+        if response.get("status") != 200:
+            raise RuntimeError(
+                f"Comix browse API returned HTTP {response.get('status')}: "
+                f"{str(response.get('body') or '')[:200]}"
+            )
+        try:
+            payload = json.loads(response.get("body") or "")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Comix browse API returned an invalid payload") from exc
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise RuntimeError("Comix browse API returned an unsuccessful payload")
+        result = payload.get("result")
         if not isinstance(result, dict):
-            raise RuntimeError("Comix discovery API returned an invalid response object")
-        if not result.get("ok"):
-            raise RuntimeError(result.get("error") or "Unknown Comix discovery API error")
+            raise RuntimeError("Comix browse API result is missing")
         return result
 
     @classmethod
@@ -528,7 +643,36 @@ class ComixAPI:
         browser = await _start_comix_browser(headless)
 
         try:
-            page = await browser.get("https://comix.to/browse")
+            page = await browser.get("about:blank")
+            await _disable_comix_browser_cache(page)
+
+            if highlights:
+                await page.get("https://comix.to/")
+                await _wait_for_comix_page(
+                    page,
+                    "Boolean(document.getElementById('initial-data'))",
+                    headless=headless,
+                    operation="discovery highlights",
+                )
+                initial_data = await _wait_for_initial_data(
+                    page,
+                    operation="discovery highlights",
+                )
+                await _publish_comix_session(browser, page)
+                await _save_comix_cookies(browser)
+                return cls._extract_discovery_highlights(initial_data, limit)
+
+            params = {}
+            if keyword:
+                params["keyword"] = keyword
+                params["sort"] = "relevance:desc"
+            if page_number > 1:
+                params["page"] = page_number
+            page_url = "https://comix.to/browse"
+            if params:
+                page_url = f"{page_url}?{urlencode(params)}"
+
+            await page.get(page_url)
             await _wait_for_comix_page(
                 page,
                 "Boolean(document.getElementById('initial-data'))",
@@ -537,15 +681,12 @@ class ComixAPI:
             )
             await _publish_comix_session(browser, page)
             await _save_comix_cookies(browser)
-
-            result = await cls._fetch_discovery_via_page_api(
+            result = await cls._fetch_browse_api(
                 page,
                 keyword=keyword,
                 page_number=page_number,
-                limit=limit,
-                highlights=highlights,
             )
-            return result
+            return {"data": result}
         finally:
             await _close_comix_browser(browser)
 
@@ -730,39 +871,6 @@ class ComixAPI:
         return None
 
     @classmethod
-    def _normalize_chapter_api_item(cls, item: dict) -> Optional[dict]:
-        """Normalize a Comix chapter API item to the app's internal row shape."""
-        if not isinstance(item, dict):
-            return None
-
-        chapter_id = cls._first_present(item, "id", "chapter_id", "chapterId")
-        number = cls._first_present(item, "number", "chap", "chapter")
-        if chapter_id is None or number is None:
-            return None
-
-        group = cls._first_present(item, "group", "scanlation_group", "scanlationGroup")
-        group_name = cls._first_present(item, "group_name", "groupName")
-        if isinstance(group, dict):
-            group_name = group.get("name") or group.get("title") or group_name
-        if not group_name and cls._first_present(item, "isOfficial", "is_official"):
-            group_name = "Official"
-
-        try:
-            chapter_id = int(chapter_id)
-        except (TypeError, ValueError):
-            return None
-
-        return {
-            "chapter_id": chapter_id,
-            "number": str(number),
-            "title": cls._first_present(item, "name", "title") or "",
-            "volume": cls._first_present(item, "volume", "vol"),
-            "votes": cls._first_present(item, "votes", "vote_count", "voteCount") or 0,
-            "group_name": group_name,
-            "pages_count": cls._first_present(item, "pages_count", "pagesCount") or 0,
-        }
-
-    @classmethod
     def _normalize_chapter_dom_row(cls, row: dict) -> Optional[dict]:
         """Normalize a chapter row scraped from the rendered chapter list."""
         href = row.get("href") if isinstance(row, dict) else None
@@ -811,195 +919,81 @@ class ComixAPI:
         return detail["hasChapters"]
 
     @classmethod
-    async def _fetch_chapters_via_page_api(cls, page, manga_code: str) -> list[dict]:
-        """
-        Fetch chapters from Comix's in-page API client.
-
-        The API is currently guarded by an obfuscated token/signing layer. Running
-        this inside the loaded page reuses Comix's own client and avoids copying
-        brittle signing code into the downloader.
-        """
-        script = f"""(async () => {{
-            const mangaCode = {json.dumps(manga_code)};
-            const limit = {cls.CHAPTERS_PAGE_LIMIT};
-            const maxPages = {cls.MAX_CHAPTER_PAGES};
-
-            async function resolveEnvModule() {{
-                const moduleScripts = Array.from(document.querySelectorAll('script[type="module"][src]'))
-                    .map((script) => script.src);
-
-                for (const scriptUrl of moduleScripts) {{
-                    try {{
-                        const response = await fetch(scriptUrl, {{ credentials: 'same-origin' }});
-                        if (!response.ok) continue;
-                        const source = await response.text();
-                        const matches = Array.from(source.matchAll(/from\\s*["']\\.\\/(env-[^"']+\\.js)["']/g));
-                        for (const match of matches) {{
-                            const moduleUrl = new URL(match[1], scriptUrl).href;
-                            try {{
-                                return await import(moduleUrl);
-                            }} catch (e) {{}}
-                        }}
-                    }} catch (e) {{}}
-                }}
-
-                throw new Error('Comix API module not found');
-            }}
-
-            function findMangaApi(module) {{
-                for (const value of Object.values(module)) {{
-                    if (value && typeof value === 'object' && typeof value.chapters === 'function') {{
-                        return value;
-                    }}
-                }}
-                return null;
-            }}
-
-            const module = await resolveEnvModule();
-            const api = findMangaApi(module);
-            if (!api) throw new Error('Comix manga API export not found');
-
-            const items = [];
-            const seenIds = new Set();
-
-            for (let page = 1; page <= maxPages; page += 1) {{
-                const data = await api.chapters(mangaCode, {{
-                    page,
-                    limit,
-                    order: {{ number: 'desc' }},
-                }});
-
-                const pageItems = Array.isArray(data && data.items) ? data.items : [];
-                for (const item of pageItems) {{
-                    const id = item && (item.id ?? item.chapter_id ?? item.chapterId);
-                    if (id == null || seenIds.has(String(id))) continue;
-                    seenIds.add(String(id));
-                    items.push(item);
-                }}
-
-                const meta = (data && data.meta) || {{}};
-                if (
-                    pageItems.length === 0 ||
-                    meta.hasNext === false ||
-                    (Number(meta.lastPage) > 0 && page >= Number(meta.lastPage))
-                ) {{
-                    break;
-                }}
-            }}
-
-            return JSON.stringify({{ ok: true, items }});
-        }})().catch((error) => JSON.stringify({{
-            ok: false,
-            error: error && error.message ? error.message : String(error),
-        }}))"""
-
-        # nodriver does not await JavaScript promises by default. Without this
-        # flag the async IIFE returns before it resolves and evaluate() yields
-        # no serialized value, which used to become the misleading "Unknown
-        # Comix page API error" and trigger the timing-sensitive DOM fallback.
-        result_str = await page.evaluate(
-            script,
-            await_promise=True,
-            return_by_value=True,
-        )
-        if not isinstance(result_str, str) or not result_str:
-            raise RuntimeError("Comix page API evaluation returned no serialized result")
-        try:
-            result = json.loads(result_str)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("Comix page API returned invalid JSON") from exc
-        if not isinstance(result, dict):
-            raise RuntimeError("Comix page API returned an invalid response object")
-        if not result.get("ok"):
-            raise RuntimeError(result.get("error") or "Unknown Comix page API error")
-
-        rows = []
-        for item in result.get("items", []):
-            row = cls._normalize_chapter_api_item(item)
-            if row:
-                rows.append(row)
-        return cls._dedupe_chapter_rows(rows)
-    
-    @classmethod
     async def _get_all_chapters_async(cls, manga_code: str, headless: bool) -> list[dict]:
         url = f"https://comix.to/title/{manga_code}"
         browser = await _start_comix_browser(headless)
-                
-        scrape_js = """(() => {
-            const rows = Array.from(document.querySelectorAll('.mchap-item')).map(li => {
-                const a = li.querySelector('.mchap-row__primary');
-                const ch = li.querySelector('.mchap-row__ch');
-                const ti = li.querySelector('.mchap-row__title');
-                const gp = li.querySelector('.mchap-row__group');
-                return {
-                    href: a ? a.getAttribute('href') : null,
-                    chap_label: ch ? ch.textContent.trim() : null,
-                    title: ti ? ti.textContent.trim() : null,
-                    group: gp ? (gp.querySelector('span') ? gp.querySelector('span').textContent.trim() : gp.textContent.trim()) : null,
-                    group_official: gp ? gp.classList.contains('is-official') : false,
-                };
-            });
-            return JSON.stringify(rows);
-        })()"""
-        
-        all_rows = []
-        seen_ids = set()
-        
+
         try:
-            page = await browser.get(url)
-            await _wait_for_comix_page(
-                page,
-                "Boolean(document.getElementById('initial-data'))",
-                headless=headless,
-                operation="chapter listing",
-            )
-            initial_data = await _wait_for_initial_data(
-                page,
-                operation="chapter listing",
-                manga_code=manga_code,
-            )
-            await _publish_comix_session(browser, page)
-            await _save_comix_cookies(browser)
+            page = await browser.get("about:blank")
+            await _disable_comix_browser_cache(page)
+            await page.get(url)
 
-            has_chapters = cls._manga_has_chapters(initial_data, manga_code)
+            async def load_page() -> Optional[bool]:
+                await _wait_for_comix_page(
+                    page,
+                    "Boolean(document.getElementById('initial-data'))",
+                    headless=headless,
+                    operation="chapter listing",
+                )
+                initial_data = await _wait_for_initial_data(
+                    page,
+                    operation="chapter listing",
+                    manga_code=manga_code,
+                )
+                await _publish_comix_session(browser, page)
+                await _save_comix_cookies(browser)
+                return cls._manga_has_chapters(initial_data, manga_code)
 
-            try:
-                api_rows = await cls._fetch_chapters_via_page_api(page, manga_code)
-                if api_rows:
-                    logger.info(f"Fetched {len(api_rows)} chapters using Comix page API")
-                    return api_rows
-                logger.warning("Comix page API returned no chapters; falling back to DOM scraping")
-            except Exception as e:
-                logger.warning(f"Comix page API chapter fetch failed: {e}. Falling back to DOM scraping")
-            
+            has_chapters = await load_page()
+            if has_chapters is False:
+                return []
+
+            if not await _has_waf_pass(browser):
+                await _solve_comix_waf_challenge(browser, page, headless=headless)
+                await page.get(url)
+                has_chapters = await load_page()
+
+            rows = await _wait_for_chapter_rows(page)
+            if not rows:
+                # A stored pass can go stale without disappearing from the jar.
+                await _solve_comix_waf_challenge(
+                    browser, page, headless=headless, force=True
+                )
+                await page.get(url)
+                has_chapters = await load_page()
+                rows = await _wait_for_chapter_rows(page)
+
+            if not rows:
+                if has_chapters:
+                    raise RuntimeError(
+                        "Comix reports chapters exist, but no chapter rows could be fetched"
+                    )
+                return []
+
+            all_rows = []
+            seen_ids = set()
             prev_first_href = None
             consecutive_dup_pages = 0
-            
+
             for page_n in range(1, cls.MAX_CHAPTER_PAGES + 1):
-                page_url = f"{url}?page={page_n}"
-                if page_n > 1 or page_url != page.url:
-                    await page.get(page_url)
-                    
-                rows = []
-                for _ in range(20):
-                    rows_str = await page.evaluate(scrape_js)
-                    rows = json.loads(rows_str) if rows_str else []
-                    if rows:
-                        if prev_first_href is None or rows[0].get("href") != prev_first_href:
-                            break
-                    await page.sleep(0.2)
-                
+                if page_n > 1:
+                    await page.get(f"{url}?page={page_n}")
+                    rows = await _wait_for_chapter_rows(
+                        page,
+                        timeout=_CHAPTER_PAGE_TIMEOUT_SECONDS,
+                        previous_first_href=prev_first_href,
+                    )
                 if not rows:
                     break
-                    
+
                 prev_first_href = rows[0].get("href")
                 page_added = 0
-                
+
                 for row in rows:
                     href = row.get("href")
                     if not href:
                         continue
-                    
+
                     normalized = cls._normalize_chapter_dom_row(row)
                     if not normalized:
                         continue
@@ -1010,17 +1004,19 @@ class ComixAPI:
                     seen_ids.add(normalized["chapter_id"])
                     all_rows.append(normalized)
                     page_added += 1
-                    
+
                 if page_added == 0:
                     consecutive_dup_pages += 1
                     if consecutive_dup_pages >= 2:
                         break
                 else:
                     consecutive_dup_pages = 0
-            
+
             all_rows = cls._dedupe_chapter_rows(all_rows)
             if not all_rows and has_chapters:
-                raise RuntimeError("Comix reports chapters exist, but no chapter rows could be fetched")
+                raise RuntimeError(
+                    "Comix reports chapters exist, but no chapter rows could be fetched"
+                )
 
             return all_rows
         finally:
@@ -1028,7 +1024,7 @@ class ComixAPI:
 
     @classmethod
     def get_all_chapters(cls, manga_code: str, headless: Optional[bool] = None) -> list[any]:
-        """Fetch all chapters for a manga using Comix's page API with DOM fallback."""
+        """Fetch all chapters for a manga from Comix's rendered chapter list."""
         from ..core.models import Chapter
         if headless is None:
             from ..utils.config import ConfigManager

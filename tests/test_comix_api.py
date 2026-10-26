@@ -31,18 +31,6 @@ ComixAPI = load_comix_api()
 comix_module = importlib.import_module("src.api.comix")
 
 
-class FakePage:
-    def __init__(self, result):
-        self.result = result
-        self.script = None
-        self.evaluate_kwargs = None
-
-    async def evaluate(self, script, **kwargs):
-        self.script = script
-        self.evaluate_kwargs = kwargs
-        return self.result
-
-
 class ChallengePage:
     def __init__(self, *, clears: bool):
         self.challenge = True
@@ -336,94 +324,92 @@ class ComixChapterTests(unittest.TestCase):
         self.assertTrue(page.has_next)
         self.assertTrue(page.has_previous)
 
-    def test_discovery_page_api_uses_current_client_and_all_ratings(self):
-        page = FakePage(
-            '{"ok":true,"data":{"items":['
-            '{"hid":"a1","title":"One","url":"/title/a1-one"}'
-            '],"meta":{"page":1,"lastPage":1,"total":1}}}'
-        )
+    def test_extracts_homepage_highlights(self):
+        initial_data = {
+            "queries": {
+                '["manga", "top", {"type": "trending", "days": 1, "limit": 50}]': [
+                    {"hid": "t1", "title": "Trend", "url": "/title/t1-trend"},
+                ],
+                '["manga", "list", {"scope": "hot", "order": {"chapter_updated_at": "desc"}}]': {
+                    "items": [
+                        {"hid": "l1", "title": "Latest", "url": "/title/l1-latest"},
+                    ]
+                },
+            }
+        }
 
-        result = asyncio.run(ComixAPI._fetch_discovery_via_page_api(
-            page, keyword="one", page_number=2, limit=20
+        result = ComixAPI._extract_discovery_highlights(initial_data, limit=8)
+
+        self.assertEqual(result["trending"][0]["hid"], "t1")
+        self.assertEqual(result["latest"]["items"][0]["hid"], "l1")
+
+    def test_extract_highlights_falls_back_to_first_rails(self):
+        initial_data = {
+            "queries": {
+                '["manga", "top", {"type": "follows"}]': [
+                    {"hid": "t1", "title": "Top"},
+                ],
+                '["manga", "list", {"order": {"created_at": "desc"}}]': {
+                    "items": [{"hid": "l1", "title": "List"}]
+                },
+            }
+        }
+
+        result = ComixAPI._extract_discovery_highlights(initial_data, limit=8)
+
+        self.assertEqual(result["trending"][0]["hid"], "t1")
+        self.assertEqual(result["latest"]["items"][0]["hid"], "l1")
+
+    def test_extract_highlights_rejects_missing_catalog(self):
+        with self.assertRaisesRegex(RuntimeError, "did not include"):
+            ComixAPI._extract_discovery_highlights({"queries": {}}, limit=8)
+
+    def test_browse_api_reuses_observed_request_and_unwraps_result(self):
+        class BrowsePage:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, script, **kwargs):
+                self.calls.append((script, kwargs))
+                if "performance.getEntriesByType" in script:
+                    return "https://comix.to/api/v1/manga?page=2&keyword=one&_=token"
+                return json.dumps({
+                    "status": 200,
+                    "body": json.dumps({
+                        "status": "ok",
+                        "result": {"items": [{"hid": "a1"}], "meta": {"page": 2}},
+                    }),
+                })
+
+            async def sleep(self, _seconds):
+                pass
+
+        page = BrowsePage()
+        result = asyncio.run(ComixAPI._fetch_browse_api(
+            page, keyword="one", page_number=2
         ))
 
-        self.assertTrue(result["ok"])
-        self.assertIn("api.list", page.script)
-        self.assertIn("relevance: 'desc'", page.script)
-        self.assertIn("safe", page.script)
-        self.assertIn("pornographic", page.script)
-        self.assertIn('const pageNumber = 2', page.script)
-        self.assertEqual(page.evaluate_kwargs, {"await_promise": True, "return_by_value": True})
-
-    def test_discovery_page_api_reports_errors(self):
-        page = FakePage('{"ok":false,"error":"catalog unavailable"}')
-
-        with self.assertRaisesRegex(RuntimeError, "catalog unavailable"):
-            asyncio.run(ComixAPI._fetch_discovery_via_page_api(page))
-
-    def test_discovery_highlights_use_trending_and_latest_calls(self):
-        page = FakePage(
-            '{"ok":true,"trending":['
-            '{"hid":"t1","title":"Trend","url":"/title/t1-trend"}],'
-            '"latest":{"items":['
-            '{"hid":"l1","title":"Latest","url":"/title/l1-latest"}]}}'
+        self.assertEqual(result["items"][0]["hid"], "a1")
+        self.assertIn('const keyword = "one"', page.calls[0][0])
+        self.assertIn("const pageNumber = 2", page.calls[0][0])
+        self.assertEqual(
+            page.calls[1][1], {"await_promise": True, "return_by_value": True}
         )
 
-        result = asyncio.run(ComixAPI._fetch_discovery_via_page_api(
-            page, highlights=True, limit=8
-        ))
+    def test_browse_api_reports_http_error(self):
+        class BrowsePage:
+            async def evaluate(self, script, **kwargs):
+                if "performance.getEntriesByType" in script:
+                    return "https://comix.to/api/v1/manga?page=1&_=token"
+                return json.dumps({"status": 403, "body": "Missing token"})
 
-        self.assertEqual(result["trending"][0]["title"], "Trend")
-        self.assertIn("api.top", page.script)
-        self.assertIn("days: 7", page.script)
-        self.assertIn("chapter_updated_at: 'desc'", page.script)
+            async def sleep(self, _seconds):
+                pass
 
-    def test_normalizes_current_chapter_api_shape(self):
-        row = ComixAPI._normalize_chapter_api_item({
-            "id": "9744989",
-            "number": 100,
-            "name": "Finale",
-            "volume": 2,
-            "group": {"id": 9897, "name": "Official"},
-            "pagesCount": 42,
-        })
-
-        self.assertEqual(row["chapter_id"], 9744989)
-        self.assertEqual(row["number"], "100")
-        self.assertEqual(row["title"], "Finale")
-        self.assertEqual(row["volume"], 2)
-        self.assertEqual(row["group_name"], "Official")
-        self.assertEqual(row["pages_count"], 42)
-
-    def test_normalizes_legacy_chapter_api_shape(self):
-        row = ComixAPI._normalize_chapter_api_item({
-            "chapter_id": 1537020,
-            "number": "1",
-            "title": "Start",
-            "scanlation_group": {"name": "MagusManga"},
-            "pages_count": 18,
-            "votes": 7,
-        })
-
-        self.assertEqual(row["chapter_id"], 1537020)
-        self.assertEqual(row["title"], "Start")
-        self.assertEqual(row["group_name"], "MagusManga")
-        self.assertEqual(row["pages_count"], 18)
-        self.assertEqual(row["votes"], 7)
-
-    def test_uses_official_group_when_api_has_no_group_name(self):
-        row = ComixAPI._normalize_chapter_api_item({
-            "id": 1,
-            "number": "12",
-            "isOfficial": True,
-        })
-
-        self.assertEqual(row["group_name"], "Official")
-
-    def test_rejects_api_items_without_required_identity(self):
-        self.assertIsNone(ComixAPI._normalize_chapter_api_item({"id": 1}))
-        self.assertIsNone(ComixAPI._normalize_chapter_api_item({"number": "1"}))
-        self.assertIsNone(ComixAPI._normalize_chapter_api_item({"id": "bad", "number": "1"}))
+        with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+            asyncio.run(ComixAPI._fetch_browse_api(
+                BrowsePage(), keyword="", page_number=1
+            ))
 
     def test_normalizes_dom_row(self):
         row = ComixAPI._normalize_chapter_dom_row({
@@ -450,46 +436,80 @@ class ComixChapterTests(unittest.TestCase):
             {"chapter_id": 2, "number": "2"},
         ])
 
-    def test_page_api_result_is_normalized_and_deduped(self):
-        page = FakePage(
-            '{"ok":true,"items":['
-            '{"id":2,"number":"2","name":"Two","group":{"name":"A"}},'
-            '{"id":2,"number":"2","name":"Two again","group":{"name":"A"}},'
-            '{"id":1,"number":"1","isOfficial":true}'
-            ']}'
-        )
+    def test_wait_for_chapter_rows_waits_for_new_first_row(self):
+        class PagedPage:
+            def __init__(self):
+                self.calls = 0
 
-        rows = asyncio.run(ComixAPI._fetch_chapters_via_page_api(page, "y86v"))
+            async def evaluate(self, script, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return json.dumps([{"href": "/title/x/1-chapter-1"}])
+                return json.dumps([{"href": "/title/x/2-chapter-2"}])
 
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["chapter_id"], 2)
-        self.assertEqual(rows[0]["title"], "Two")
-        self.assertEqual(rows[1]["chapter_id"], 1)
-        self.assertEqual(rows[1]["group_name"], "Official")
-        self.assertIn("api.chapters", page.script)
-        self.assertIn("order: { number: 'desc' }", page.script)
-        self.assertEqual(
-            page.evaluate_kwargs,
-            {"await_promise": True, "return_by_value": True},
-        )
+            async def sleep(self, _seconds):
+                pass
 
-    def test_page_api_error_raises_useful_exception(self):
-        page = FakePage('{"ok":false,"error":"Comix API module not found"}')
+        rows = asyncio.run(comix_module._wait_for_chapter_rows(
+            PagedPage(),
+            previous_first_href="/title/x/1-chapter-1",
+            timeout=1,
+        ))
 
-        with self.assertRaisesRegex(RuntimeError, "Comix API module not found"):
-            asyncio.run(ComixAPI._fetch_chapters_via_page_api(page, "y86v"))
+        self.assertEqual(rows[0]["href"], "/title/x/2-chapter-2")
 
-    def test_page_api_rejects_missing_serialized_result(self):
-        page = FakePage(None)
+    def test_waf_challenge_persists_pass_cookie(self):
+        class Cookies:
+            passed = False
 
-        with self.assertRaisesRegex(RuntimeError, "no serialized result"):
-            asyncio.run(ComixAPI._fetch_chapters_via_page_api(page, "y86v"))
+            async def get_all(self):
+                if self.passed:
+                    return [types.SimpleNamespace(name="waf_pass")]
+                return []
 
-    def test_page_api_rejects_invalid_json_result(self):
-        page = FakePage("not-json")
+        class Browser:
+            cookies = Cookies()
 
-        with self.assertRaisesRegex(RuntimeError, "invalid JSON"):
-            asyncio.run(ComixAPI._fetch_chapters_via_page_api(page, "y86v"))
+        class ChallengePage:
+            url = None
+
+            async def get(self, url):
+                self.url = url
+                Browser.cookies.passed = True
+
+            async def sleep(self, _seconds):
+                pass
+
+        page = ChallengePage()
+        saved = []
+
+        async def save(_browser):
+            saved.append(True)
+
+        with patch.object(comix_module, "_save_comix_cookies", new=save):
+            passed = asyncio.run(comix_module._solve_comix_waf_challenge(
+                Browser(), page, headless=True
+            ))
+
+        self.assertTrue(passed)
+        self.assertEqual(page.url, comix_module._WAF_CHALLENGE_URL)
+        self.assertEqual(saved, [True])
+
+    def test_waf_challenge_is_skipped_when_pass_exists(self):
+        class Cookies:
+            async def get_all(self):
+                return [types.SimpleNamespace(name="waf_pass")]
+
+        class Browser:
+            cookies = Cookies()
+
+        class ChallengePage:
+            async def get(self, url):
+                raise AssertionError("challenge should not open")
+
+        self.assertFalse(asyncio.run(comix_module._solve_comix_waf_challenge(
+            Browser(), ChallengePage(), headless=True
+        )))
 
 
 if __name__ == "__main__":

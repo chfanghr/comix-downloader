@@ -69,3 +69,9 @@ def load_cdp_page() -> ModuleType:
     """Import nodriver.cdp.page after installing the same fallback."""
     install_nodriver_compat()
     return importlib.import_module("nodriver.cdp.page")
+
+
+def load_cdp_network() -> ModuleType:
+    """Import nodriver.cdp.network after installing the same fallback."""
+    install_nodriver_compat()
+    return importlib.import_module("nodriver.cdp.network")
