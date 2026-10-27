@@ -492,6 +492,26 @@ class ComixChapterTests(unittest.TestCase):
             {"await_promise": True, "return_by_value": True},
         )
 
+    def test_current_page_api_response_shape_is_parsed(self):
+        page = FakePage(
+            '{"ok":true,"t9":['
+            '{"MV":123,"number":"7","name":"Seven","ek":"Official"}'
+            ']}'
+        )
+
+        rows = asyncio.run(ComixAPI._fetch_chapters_via_page_api(page, "y86v"))
+
+        self.assertEqual(rows, [{
+            "chapter_id": 123,
+            "number": "7",
+            "title": "Seven",
+            "volume": None,
+            "votes": 0,
+            "group_name": "Official",
+            "pages_count": 0,
+        }])
+        self.assertIn("api.dq", page.script)
+
     def test_page_api_error_raises_useful_exception(self):
         page = FakePage('{"ok":false,"error":"Comix API module not found"}')
 

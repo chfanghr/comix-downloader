@@ -23,6 +23,9 @@ logger = get_logger(__name__)
 
 # Global lock to synchronize browser creation and cookie loading/saving across threads
 _browser_lock = threading.Lock()
+_captcha_prompt_lock = threading.Lock()
+_captcha_prompted = threading.Event()
+_INTERACTIVE_CAPTCHA = False
 
 _CANONICAL_COOKIE_FILE = default_config_path().parent / "cf_cookies.dat"
 _CLOUDFLARE_TIMEOUT_SECONDS = 60.0
@@ -32,6 +35,13 @@ _INITIAL_DATA_TIMEOUT_SECONDS = 15.0
 _INITIAL_DATA_POLL_SECONDS = 0.05
 _CHAPTER_EXTRACTION_MIN_SECONDS = 180.0
 _CHAPTER_EXTRACTION_MAX_SECONDS = 900.0
+
+
+def set_interactive_captcha(enabled: bool) -> None:
+    """Enable visible, user-assisted CAPTCHA handling for the current run."""
+    global _INTERACTIVE_CAPTCHA
+    _INTERACTIVE_CAPTCHA = bool(enabled)
+    _captcha_prompted.clear()
 
 
 class MangaInfoFetchError(RuntimeError):
@@ -176,6 +186,18 @@ async def _wait_for_comix_page(
             last_title = (await page.evaluate("document.title")) or ""
             challenge = await _page_has_cloudflare_challenge(page)
             saw_challenge = saw_challenge or challenge
+            if challenge and _INTERACTIVE_CAPTCHA and not _captcha_prompted.is_set():
+                with _captcha_prompt_lock:
+                    if not _captcha_prompted.is_set():
+                        logger.warning(
+                            "CAPTCHA detected. Solve it in the visible browser window, "
+                            "then press Enter here to continue."
+                        )
+                        try:
+                            input("Press Enter after solving the CAPTCHA: ")
+                        except EOFError:
+                            logger.warning("No interactive terminal is available for CAPTCHA input")
+                        _captcha_prompted.set()
             if unavailable_script and bool(await page.evaluate(unavailable_script)):
                 raise ComixPageUnavailableError(
                     f"Comix {operation} is unavailable (the requested route was not found)"
@@ -474,8 +496,9 @@ class ComixAPI:
             }}
 
             function findMangaApi(module) {{
-                for (const value of Object.values(module)) {{
-                    if (value && typeof value === 'object' &&
+                const candidates = [module.f, ...Object.values(module)];
+                for (const value of candidates) {{
+                    if (value && (typeof value === 'object' || typeof value === 'function') &&
                         ((typeof value.list === 'function' && typeof value.top === 'function') ||
                          (typeof value.ks === 'function' && typeof value.XU === 'function'))) {{
                         return value;
@@ -751,13 +774,13 @@ class ComixAPI:
         if not isinstance(item, dict):
             return None
 
-        chapter_id = cls._first_present(item, "id", "chapter_id", "chapterId")
+        chapter_id = cls._first_present(item, "id", "chapter_id", "chapterId", "MV", "Fl")
         number = cls._first_present(item, "number", "chap", "chapter")
         if chapter_id is None or number is None:
             return None
 
         group = cls._first_present(item, "group", "scanlation_group", "scanlationGroup")
-        group_name = cls._first_present(item, "group_name", "groupName")
+        group_name = cls._first_present(item, "group_name", "groupName", "ek")
         if isinstance(group, dict):
             group_name = group.get("name") or group.get("title") or group_name
         if not group_name and cls._first_present(item, "isOfficial", "is_official"):
@@ -870,9 +893,10 @@ class ComixAPI:
             }}
 
             function findMangaApi(module) {{
-                for (const value of Object.values(module)) {{
-                    if (value && typeof value === 'object' &&
-                        (typeof value.chapters === 'function' || typeof value.uw === 'function')) {{
+                const candidates = [module.f, ...Object.values(module)];
+                for (const value of candidates) {{
+                    if (value && (typeof value === 'object' || typeof value === 'function') &&
+                        (typeof value.chapters === 'function' || typeof value.uw === 'function' || typeof value.dq === 'function')) {{
                         return value;
                     }}
                 }}
@@ -882,7 +906,7 @@ class ComixAPI:
             const module = await resolveApiModule();
             const api = findMangaApi(module);
             if (!api) throw new Error('Comix manga API export not found');
-            const chapters = api.chapters || api.uw;
+            const chapters = api.chapters || api.uw || api.dq;
 
             const items = [];
             const seenIds = new Set();
@@ -894,7 +918,13 @@ class ComixAPI:
                     order: {{ number: 'desc' }},
                 }});
 
-                const pageItems = Array.isArray(data && data.items) ? data.items : [];
+                const pageItems = Array.isArray(data && data.items)
+                    ? data.items
+                    : Array.isArray(data && data.Vu)
+                        ? data.Vu
+                        : Array.isArray(data && data.t9)
+                            ? data.t9
+                            : [];
                 for (const item of pageItems) {{
                     const id = item && (item.id ?? item.chapter_id ?? item.chapterId);
                     if (id == null || seenIds.has(String(id))) continue;
@@ -902,7 +932,7 @@ class ComixAPI:
                     items.push(item);
                 }}
 
-                const meta = (data && data.meta) || {{}};
+                const meta = (data && (data.meta || data.pe || data.zV)) || {{}};
                 if (
                     pageItems.length === 0 ||
                     meta.hasNext === false ||
@@ -938,15 +968,28 @@ class ComixAPI:
         if not result.get("ok"):
             raise RuntimeError(result.get("error") or "Unknown Comix page API error")
 
+        raw_items = result.get("items")
+        if not isinstance(raw_items, list):
+            raw_items = result.get("Vu")
+        if not isinstance(raw_items, list):
+            raw_items = result.get("t9")
+        if not isinstance(raw_items, list):
+            raw_items = []
+
         rows = []
-        for item in result.get("items", []):
+        for item in raw_items:
             row = cls._normalize_chapter_api_item(item)
             if row:
                 rows.append(row)
         return cls._dedupe_chapter_rows(rows)
     
     @classmethod
-    async def _get_all_chapters_async(cls, manga_code: str, headless: bool) -> list[dict]:
+    async def _get_all_chapters_async(
+        cls,
+        manga_code: str,
+        headless: bool,
+        force_dom: bool = False,
+    ) -> list[dict]:
         url = f"https://comix.to/title/{manga_code}"
         browser = await _start_comix_browser(headless)
                 
@@ -988,14 +1031,17 @@ class ComixAPI:
 
             has_chapters = cls._manga_has_chapters(initial_data, manga_code)
 
-            try:
-                api_rows = await cls._fetch_chapters_via_page_api(page, manga_code)
-                if api_rows:
-                    logger.info(f"Fetched {len(api_rows)} chapters using Comix page API")
-                    return api_rows
-                logger.warning("Comix page API returned no chapters; falling back to DOM scraping")
-            except Exception as e:
-                logger.warning(f"Comix page API chapter fetch failed: {e}. Falling back to DOM scraping")
+            if not force_dom:
+                try:
+                    api_rows = await cls._fetch_chapters_via_page_api(page, manga_code)
+                    if api_rows:
+                        logger.info(f"Fetched {len(api_rows)} chapters using Comix page API")
+                        return api_rows
+                    logger.warning("Comix page API returned no chapters; falling back to DOM scraping")
+                except Exception as e:
+                    logger.warning(f"Comix page API chapter fetch failed: {e}. Falling back to DOM scraping")
+            else:
+                logger.info("Using forced DOM chapter extraction")
             
             prev_first_href = None
             consecutive_dup_pages = 0
@@ -1052,7 +1098,12 @@ class ComixAPI:
             await _close_comix_browser(browser)
 
     @classmethod
-    def get_all_chapters(cls, manga_code: str, headless: Optional[bool] = None) -> list[any]:
+    def get_all_chapters(
+        cls,
+        manga_code: str,
+        headless: Optional[bool] = None,
+        force_dom: bool = False,
+    ) -> list[any]:
         """Fetch all chapters for a manga using Comix's page API with DOM fallback."""
         from ..core.models import Chapter
         if headless is None:
@@ -1063,7 +1114,7 @@ class ComixAPI:
         
         chapters: list[Chapter] = []
         try:
-            rows = run_async(cls._get_all_chapters_async(manga_code, headless))
+            rows = run_async(cls._get_all_chapters_async(manga_code, headless, force_dom))
             for row in rows:
                 chapters.append(Chapter(
                     chapter_id=row["chapter_id"],

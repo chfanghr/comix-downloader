@@ -173,6 +173,16 @@ def download(
         "--ignore-progress",
         help="Ignore and reset saved chapter download progress",
     ),
+    dom_chapters: bool = typer.Option(
+        False,
+        "--dom-chapters",
+        help="Force legacy DOM-based chapter extraction",
+    ),
+    interactive_captcha: bool = typer.Option(
+        False,
+        "--interactive-captcha",
+        help="Show the browser and pause for manual CAPTCHA solving",
+    ),
 ):
     """Download manga directly from command line."""
     if url:
@@ -187,15 +197,26 @@ def download(
             config,
             output_format=OutputFormat(format) if format else config.output_format,
             download_path=output if output else config.download_path,
-            headless=headless if headless is not None else config.headless,
+            headless=(
+                False
+                if interactive_captcha
+                else headless if headless is not None else config.headless
+            ),
             ignore_progress=ignore_progress,
+            force_dom_chapters=dom_chapters,
+            interactive_captcha=interactive_captcha,
         )
         setup_logging(enable=config.enable_logs)
         
         try:
+            ComixAPI.set_interactive_captcha(config.interactive_captcha)
             manga_code = ComixAPI.extract_manga_code(url)
             manga = ComixAPI.get_manga_info(manga_code, headless=config.headless)
-            all_chapters = ComixAPI.get_all_chapters(manga_code, headless=config.headless)
+            all_chapters = ComixAPI.get_all_chapters(
+                manga_code,
+                headless=config.headless,
+                force_dom=config.force_dom_chapters,
+            )
             
             if chapters and chapters.lower() != "all":
                 from .menus import ChapterSelector

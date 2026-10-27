@@ -127,3 +127,5 @@ class DownloadConfig:
     retry_delay: float = 2.0
     headless: bool = True
     ignore_progress: bool = False
+    force_dom_chapters: bool = False
+    interactive_captcha: bool = False
