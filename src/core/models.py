@@ -129,3 +129,4 @@ class DownloadConfig:
     ignore_progress: bool = False
     force_dom_chapters: bool = False
     interactive_captcha: bool = False
+    flaresolverr_url: str | None = None

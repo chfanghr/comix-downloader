@@ -168,7 +168,11 @@ async def _get_desktop_user_agent(uc: Any, config_factory: Any) -> str:
         return _user_agent_cache
 
 
-async def start_browser(headless: bool, nodriver: Any = None):
+async def start_browser(
+    headless: bool,
+    nodriver: Any = None,
+    user_agent: str | None = None,
+):
     """Start nodriver using the shared browser argument policy."""
     if not isinstance(headless, bool):
         raise TypeError(f"headless must be a bool, got {type(headless).__name__}")
@@ -185,7 +189,11 @@ async def start_browser(headless: bool, nodriver: Any = None):
 
     config = _make_config(config_factory, headless=headless, browser_args=browser_args)
     _validate_effective_args(headless, list(config()))
-    desktop_user_agent = await _get_desktop_user_agent(uc, config_factory)
+    desktop_user_agent = (
+        normalize_desktop_user_agent(user_agent)
+        if user_agent
+        else await _get_desktop_user_agent(uc, config_factory)
+    )
     user_agent_arg = f"--user-agent={desktop_user_agent}"
     add_argument = getattr(config, "add_argument", None)
     if not callable(add_argument):

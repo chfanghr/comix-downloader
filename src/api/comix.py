@@ -8,6 +8,7 @@ import asyncio
 import os
 import threading
 import time
+import requests
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,7 @@ _browser_lock = threading.Lock()
 _captcha_prompt_lock = threading.Lock()
 _captcha_prompted = threading.Event()
 _INTERACTIVE_CAPTCHA = False
+_FLARESOLVERR_ENDPOINT: str | None = None
 
 _CANONICAL_COOKIE_FILE = default_config_path().parent / "cf_cookies.dat"
 _CLOUDFLARE_TIMEOUT_SECONDS = 60.0
@@ -42,6 +44,32 @@ def set_interactive_captcha(enabled: bool) -> None:
     global _INTERACTIVE_CAPTCHA
     _INTERACTIVE_CAPTCHA = bool(enabled)
     _captcha_prompted.clear()
+
+
+def set_flaresolverr_endpoint(endpoint: str | None) -> None:
+    """Configure an optional local FlareSolverr service for browser bootstrap."""
+    global _FLARESOLVERR_ENDPOINT
+    _FLARESOLVERR_ENDPOINT = endpoint.rstrip("/") if endpoint else None
+
+
+def _solve_with_flaresolverr(url: str) -> tuple[str, list[dict]]:
+    endpoint = _FLARESOLVERR_ENDPOINT or ""
+    api_url = endpoint if endpoint.endswith("/v1") else f"{endpoint}/v1"
+    response = requests.post(
+        api_url,
+        json={"cmd": "request.get", "url": url, "maxTimeout": 120000},
+        timeout=150,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    solution = payload.get("solution") or {}
+    if payload.get("status") != "ok" or not solution.get("userAgent"):
+        raise RuntimeError(payload.get("message") or "FlareSolverr did not return a browser solution")
+    cookies = [
+        cookie for cookie in solution.get("cookies", [])
+        if cookie.get("domain", "").lstrip(".").lower().endswith("comix.to")
+    ]
+    return solution["userAgent"], cookies
 
 
 class MangaInfoFetchError(RuntimeError):
@@ -70,11 +98,18 @@ def _cookie_file_candidates() -> list[Path]:
     return candidates
 
 
-async def _start_comix_browser(headless: bool):
+async def _start_comix_browser(headless: bool, url: str | None = None):
     """Start a browser and load the shared Comix cookie jar if available."""
     _browser_lock.acquire()
     try:
-        browser = await start_browser(headless)
+        solver_user_agent = None
+        solver_cookies = []
+        if _FLARESOLVERR_ENDPOINT:
+            solver_user_agent, solver_cookies = await asyncio.to_thread(
+                _solve_with_flaresolverr,
+                url or "https://comix.to",
+            )
+        browser = await start_browser(headless, user_agent=solver_user_agent)
         for cookie_file in _cookie_file_candidates():
             if not cookie_file.exists():
                 continue
@@ -84,6 +119,18 @@ async def _start_comix_browser(headless: bool):
                 break
             except Exception as exc:
                 logger.warning("Failed loading cookies from %s: %s", cookie_file, exc)
+        if solver_cookies:
+            from nodriver import cdp
+
+            await browser.cookies.set_all([
+                cdp.network.CookieParam(
+                    name=cookie["name"],
+                    value=cookie["value"],
+                    domain=cookie.get("domain") or "comix.to",
+                    path=cookie.get("path") or "/",
+                )
+                for cookie in solver_cookies
+            ])
         return browser
     finally:
         _browser_lock.release()
@@ -330,6 +377,11 @@ class ComixAPI:
     def set_interactive_captcha(enabled: bool) -> None:
         """Configure manual CAPTCHA handling for the current process."""
         set_interactive_captcha(enabled)
+
+    @staticmethod
+    def set_flaresolverr_endpoint(endpoint: str | None) -> None:
+        """Configure an optional FlareSolverr endpoint for the current process."""
+        set_flaresolverr_endpoint(endpoint)
     
     @staticmethod
     def extract_manga_code(url: str) -> str:
@@ -569,7 +621,7 @@ class ComixAPI:
         highlights: bool = False,
         headless: bool,
     ) -> dict:
-        browser = await _start_comix_browser(headless)
+        browser = await _start_comix_browser(headless, "https://comix.to/browse")
 
         try:
             page = await browser.get("https://comix.to/browse")
@@ -669,7 +721,7 @@ class ComixAPI:
     @classmethod
     async def _get_manga_info_async(cls, manga_code: str, headless: bool) -> dict:
         url = f"https://comix.to/title/{manga_code}"
-        browser = await _start_comix_browser(headless)
+        browser = await _start_comix_browser(headless, url)
         
         try:
             page = await browser.get(url)
@@ -996,7 +1048,7 @@ class ComixAPI:
         force_dom: bool = False,
     ) -> list[dict]:
         url = f"https://comix.to/title/{manga_code}"
-        browser = await _start_comix_browser(headless)
+        browser = await _start_comix_browser(headless, url)
                 
         scrape_js = """(() => {
             const rows = Array.from(document.querySelectorAll('.mchap-item')).map(li => {
@@ -1151,7 +1203,7 @@ class ComixAPI:
         chapter_url = f"https://comix.to/title/{manga_slug}/{chapter_id}-chapter-{chapter_number}"
         owns_browser = browser is None
         if owns_browser:
-            browser = await _start_comix_browser(headless)
+            browser = await _start_comix_browser(headless, chapter_url)
                 
         image_urls = []
         page_count = 0

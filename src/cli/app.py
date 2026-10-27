@@ -183,6 +183,11 @@ def download(
         "--interactive-captcha",
         help="Show the browser and pause for manual CAPTCHA solving",
     ),
+    flaresolverr_url: str | None = typer.Option(
+        None,
+        "--flaresolverr-url",
+        help="Use a FlareSolverr endpoint, e.g. http://127.0.0.1:8191",
+    ),
 ):
     """Download manga directly from command line."""
     if url:
@@ -205,11 +210,13 @@ def download(
             ignore_progress=ignore_progress,
             force_dom_chapters=dom_chapters,
             interactive_captcha=interactive_captcha,
+            flaresolverr_url=flaresolverr_url,
         )
         setup_logging(enable=config.enable_logs)
         
         try:
             ComixAPI.set_interactive_captcha(config.interactive_captcha)
+            ComixAPI.set_flaresolverr_endpoint(config.flaresolverr_url)
             manga_code = ComixAPI.extract_manga_code(url)
             manga = ComixAPI.get_manga_info(manga_code, headless=config.headless)
             all_chapters = ComixAPI.get_all_chapters(
