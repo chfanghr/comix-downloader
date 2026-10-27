@@ -325,6 +325,11 @@ class ComixAPI:
     DISCOVERY_PAGE_LIMIT = 20
     DISCOVERY_HIGHLIGHT_LIMIT = 8
     DISCOVERY_CONTENT_RATINGS = ("safe", "suggestive", "erotica", "pornographic")
+
+    @staticmethod
+    def set_interactive_captcha(enabled: bool) -> None:
+        """Configure manual CAPTCHA handling for the current process."""
+        set_interactive_captcha(enabled)
     
     @staticmethod
     def extract_manga_code(url: str) -> str:

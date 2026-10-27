@@ -76,6 +76,9 @@ class StreamingInitialDataPage:
 
 
 class ComixChapterTests(unittest.TestCase):
+    def test_captcha_configuration_is_exposed_on_api_class(self):
+        ComixAPI.set_interactive_captcha(False)
+
     def test_wait_for_initial_data_ignores_truncated_stream(self):
         manga_code = "mn6wm"
         complete = json.dumps({
