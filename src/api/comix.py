@@ -17,7 +17,7 @@ from ..utils.logger import get_logger
 from ..utils.hash import generate_comix_hash
 from ..utils.config import default_config_path
 from ..utils.nodriver_browser import start_browser
-from ..utils.nodriver_compat import load_cdp_page
+from ..utils.nodriver_compat import load_cdp_network, load_cdp_page
 from ..utils.comix_session import publish_comix_credentials
 
 logger = get_logger(__name__)
@@ -32,6 +32,9 @@ _FLARESOLVERR_ENDPOINT: str | None = None
 _CANONICAL_COOKIE_FILE = default_config_path().parent / "cf_cookies.dat"
 _CLOUDFLARE_TIMEOUT_SECONDS = 60.0
 _CAPTCHA_GRACE_SECONDS = 20.0
+_WAF_COOKIE_NAME = "waf_pass"
+_WAF_CHALLENGE_URL = "https://comix.to/@waf/challenge"
+_WAF_TIMEOUT_SECONDS = 60.0
 _CLOUDFLARE_POLL_SECONDS = 0.25
 _CLOUDFLARE_TITLE = "just a moment..."
 _INITIAL_DATA_TIMEOUT_SECONDS = 15.0
@@ -218,6 +221,53 @@ async def _page_has_cloudflare_challenge(page) -> bool:
         return marker is True
     except Exception:
         return False
+
+
+async def _has_waf_pass(browser) -> bool:
+    """Return whether the browser holds Comix's WAF pass cookie."""
+    try:
+        cookies = await browser.cookies.get_all()
+    except Exception:
+        return False
+    return any(getattr(cookie, "name", "") == _WAF_COOKIE_NAME for cookie in cookies)
+
+
+async def _solve_comix_waf_challenge(browser, page, *, headless: bool) -> None:
+    """Open Comix's WAF gate and wait for its clearance cookie."""
+    if await _has_waf_pass(browser):
+        return
+
+    logger.info("Opening Comix WAF challenge (headless=%s)", headless)
+    await page.get(_WAF_CHALLENGE_URL)
+    deadline = time.monotonic() + _WAF_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if await _has_waf_pass(browser):
+            await _save_comix_cookies(browser)
+            logger.info("Comix WAF challenge passed")
+            return
+        await page.sleep(0.5)
+    raise RuntimeError(
+        f"Comix WAF verification did not complete within {int(_WAF_TIMEOUT_SECONDS)} seconds"
+    )
+
+
+async def _disable_comix_browser_cache(page) -> None:
+    """Prevent stale cached 403 responses from breaking tokenized API calls."""
+    try:
+        await page.send(load_cdp_network().enable())
+        await page.send(load_cdp_network().set_cache_disabled(cache_disabled=True))
+    except Exception as exc:
+        logger.debug("Could not disable Comix browser cache: %s", exc)
+
+
+async def _prepare_comix_page(browser, page, url: str, *, headless: bool):
+    """Prepare a page for Comix requests and recover from its WAF gate."""
+    await _disable_comix_browser_cache(page)
+    if await _page_has_cloudflare_challenge(page):
+        await _solve_comix_waf_challenge(browser, page, headless=headless)
+        page = await browser.get(url)
+        await _disable_comix_browser_cache(page)
+    return page
 
 
 async def _wait_for_comix_page(
@@ -644,6 +694,9 @@ class ComixAPI:
 
         try:
             page = await browser.get("https://comix.to/browse")
+            page = await _prepare_comix_page(
+                browser, page, "https://comix.to/browse", headless=headless
+            )
             await _wait_for_comix_page(
                 page,
                 "Boolean(document.getElementById('initial-data'))",
@@ -744,6 +797,7 @@ class ComixAPI:
         
         try:
             page = await browser.get(url)
+            page = await _prepare_comix_page(browser, page, url, headless=headless)
             await _wait_for_comix_page(
                 page,
                 "Boolean(document.getElementById('initial-data'))",
@@ -1091,6 +1145,7 @@ class ComixAPI:
         
         try:
             page = await browser.get(url)
+            page = await _prepare_comix_page(browser, page, url, headless=headless)
             await _wait_for_comix_page(
                 page,
                 "Boolean(document.getElementById('initial-data'))",
@@ -1251,6 +1306,9 @@ class ComixAPI:
                 
             # Now navigate directly to chapter page
             page = await browser.get(chapter_url)
+            page = await _prepare_comix_page(
+                browser, page, chapter_url, headless=headless
+            )
             await _wait_for_comix_page(
                 page,
                 "document.querySelectorAll('.rpage-page').length > 0",
