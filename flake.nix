@@ -72,12 +72,13 @@
               );
           runtime = pythonSet.mkVirtualEnv "comix-downloader" workspace.deps.default;
           devRuntime = pythonSet.mkVirtualEnv "comix-downloader-dev" workspace.deps.all;
+          browserRuntime = lib.optional (!pkgs.stdenv.hostPlatform.isDarwin) pkgs.chromium;
           cli = pkgs.writeShellApplication {
             name = "comix-downloader";
-            runtimeInputs = [
-              runtime
-              pkgs.chromium
-            ];
+            # On Darwin, nodriver discovers Chrome/Chromium in /Applications.
+            # nixpkgs Chromium is kept for Linux but is not a reliable Darwin
+            # runtime dependency on Apple Silicon.
+            runtimeInputs = [ runtime ] ++ browserRuntime;
             text = ''
               export PYTHONPATH=${./.}:''${PYTHONPATH:-}
               exec ${runtime}/bin/python ${./main.py} "$@"
