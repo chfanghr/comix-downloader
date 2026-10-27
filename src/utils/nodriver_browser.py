@@ -4,6 +4,7 @@ Shared nodriver browser launch helpers.
 
 import threading
 import os
+import sys
 from typing import Any
 
 from .logger import get_logger
@@ -28,7 +29,9 @@ _user_agent_cache_lock = threading.Lock()
 
 
 def _sandbox_enabled() -> bool:
-    """Use Chrome's sandbox except where root execution makes it impossible."""
+    """Use Chrome's sandbox except on launch environments that require opting out."""
+    if sys.platform == "darwin":
+        return False
     return not (os.name == "posix" and getattr(os, "geteuid", lambda: 1)() == 0)
 
 

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from src.utils import nodriver_browser
 from src.utils.nodriver_browser import get_browser_args, normalize_desktop_user_agent, start_browser
@@ -44,6 +45,10 @@ class FakeNodriver:
 class NodriverBrowserTests(unittest.TestCase):
     def setUp(self):
         nodriver_browser._user_agent_cache = None
+
+    def test_sandbox_is_disabled_on_macos(self):
+        with patch.object(nodriver_browser.sys, "platform", "darwin"):
+            self.assertFalse(nodriver_browser._sandbox_enabled())
 
     def test_normalizes_only_headless_product_token(self):
         raw = "Mozilla/5.0 Chrome/150.0.0.0 HeadlessChrome/150.0.0.0"
