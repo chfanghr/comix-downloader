@@ -31,6 +31,7 @@ _FLARESOLVERR_ENDPOINT: str | None = None
 
 _CANONICAL_COOKIE_FILE = default_config_path().parent / "cf_cookies.dat"
 _CLOUDFLARE_TIMEOUT_SECONDS = 60.0
+_CAPTCHA_GRACE_SECONDS = 20.0
 _CLOUDFLARE_POLL_SECONDS = 0.25
 _CLOUDFLARE_TITLE = "just a moment..."
 _INITIAL_DATA_TIMEOUT_SECONDS = 15.0
@@ -208,7 +209,11 @@ async def _page_has_cloudflare_challenge(page) -> bool:
         return True
     try:
         marker = await page.evaluate(
-            "Boolean(document.querySelector('#challenge-running, #challenge-stage, form#challenge-form'))"
+            """Boolean(document.querySelector(
+                '#challenge-running, #challenge-stage, form#challenge-form,
+                #cf-chl-captcha, iframe[src*="challenges.cloudflare.com"],
+                input[name="cf-turnstile-response"]'
+            ))"""
         )
         return marker is True
     except Exception:
@@ -227,12 +232,26 @@ async def _wait_for_comix_page(
     """Wait for Cloudflare verification and operation-specific DOM readiness."""
     deadline = time.monotonic() + timeout
     saw_challenge = False
+    challenge_started: float | None = None
     last_title = ""
     while time.monotonic() < deadline:
         try:
             last_title = (await page.evaluate("document.title")) or ""
             challenge = await _page_has_cloudflare_challenge(page)
             saw_challenge = saw_challenge or challenge
+            if challenge:
+                challenge_started = challenge_started or time.monotonic()
+                if (
+                    not _INTERACTIVE_CAPTCHA
+                    and not _FLARESOLVERR_ENDPOINT
+                    and time.monotonic() - challenge_started >= _CAPTCHA_GRACE_SECONDS
+                ):
+                    raise RuntimeError(
+                        "CAPTCHA challenge detected; retry with --interactive-captcha "
+                        "or --flaresolverr-url"
+                    )
+            else:
+                challenge_started = None
             if challenge and _INTERACTIVE_CAPTCHA and not _captcha_prompted.is_set():
                 with _captcha_prompt_lock:
                     if not _captcha_prompted.is_set():
