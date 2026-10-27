@@ -84,11 +84,18 @@
               exec ${runtime}/bin/python ${./main.py} "$@"
             '';
           };
+          netscapeCookiesToNodriver = pkgs.writeShellApplication {
+            name = "netscape-cookies-to-nodriver";
+            runtimeInputs = [ runtime ];
+            text = ''
+              exec ${runtime}/bin/python ${./scripts/netscape-cookies-to-nodriver.py} "$@"
+            '';
+          };
         in
         {
           packages = {
             default = cli;
-            inherit cli runtime;
+            inherit cli netscapeCookiesToNodriver runtime;
           };
 
           devshells.default = {
