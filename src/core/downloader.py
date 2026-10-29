@@ -147,6 +147,11 @@ class _ChapterProgress:
         temporary_manifest = self.manifest.with_suffix(".tmp")
         temporary_manifest.write_text(json.dumps(metadata), encoding="utf-8")
         temporary_manifest.replace(self.manifest)
+        for page_path in self.directory.glob("*.bin"):
+            try:
+                page_path.unlink()
+            except OSError:
+                pass
 
     def reset(self) -> None:
         shutil.rmtree(self.directory, ignore_errors=True)

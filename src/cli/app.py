@@ -196,6 +196,15 @@ def download(
             Display.error("Invalid format. Choose one of: images, pdf, cbz")
             raise typer.Exit(1)
 
+        # Direct Python callers receive Typer's OptionInfo defaults rather than
+        # the values Typer normally injects during CLI invocation.
+        ignore_progress = ignore_progress if isinstance(ignore_progress, bool) else False
+        dom_chapters = dom_chapters if isinstance(dom_chapters, bool) else False
+        interactive_captcha = (
+            interactive_captcha if isinstance(interactive_captcha, bool) else False
+        )
+        flaresolverr_url = flaresolverr_url if isinstance(flaresolverr_url, str) else None
+
         config_manager = ConfigManager()
         config = config_manager.get_download_config()
         config = replace(

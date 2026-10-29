@@ -21,11 +21,12 @@ class ChapterProgressTests(unittest.TestCase):
             self.assertIn('"1nkd"', (progress.directory / "progress.json").read_text())
             self.assertFalse(progress.is_complete())
 
-            progress.mark_complete()
-            self.assertTrue(progress.is_complete())
-
             (progress.directory / "00002.bin").write_bytes(b"not an image")
             self.assertEqual(progress.load(), {1: data})
+
+            progress.mark_complete()
+            self.assertTrue(progress.is_complete())
+            self.assertFalse((progress.directory / "00001.bin").exists())
 
             progress.reset()
             self.assertFalse(progress.directory.exists())
